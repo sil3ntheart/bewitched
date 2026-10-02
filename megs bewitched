@@ -637,7 +637,8 @@ end
 -- ============================================================
 -- UI
 -- ============================================================
-UI.AddTab("Megs Script", function(tab)
+UI.AddTab("^.^ Meg", function(tab)
+    -- LEFT COLUMN: ESP first, then Actions immediately after
     local esp = tab:Section("ESP", "Left")
 
     esp:Toggle("esp_enabled", "Enable ESP", false, function(on) flags.enabled = on; scheduleSave() end)
@@ -651,6 +652,38 @@ UI.AddTab("Megs Script", function(tab)
     esp:Toggle("esp_channeling", "Channeling", flags.channeling, function(on) flags.channeling = on; scheduleSave() end)
     esp:Tip("Shows who a player is channeling at")
 
+    -- Actions declared immediately after ESP so Matcha puts it in the left column
+    local actions = tab:Section("Actions", "Left")
+    actions:Button("Reset Defaults", function()
+        flags.name = true
+        flags.health = true
+        flags.character = true
+        flags.regent = true
+        flags.linked = true
+        flags.channeling = true
+        flags.totem = true
+        flags.totemNotify = true
+        flags.regentNotify = true
+        flags.bones = true
+        flags.distance = false
+        flags.maxDist = 2000
+        flags.nameColor = Color3.fromRGB(255, 255, 255)
+        flags.healthColor = Color3.fromRGB(120, 255, 120)
+        flags.charColor = Color3.fromRGB(255, 200, 100)
+        flags.regentColor = Color3.fromRGB(255, 215, 0)
+        flags.linkedColor = Color3.fromRGB(100, 200, 255)
+        flags.channelColor = Color3.fromRGB(180, 255, 100)
+        flags.totemColor = Color3.fromRGB(255, 100, 200)
+        flags.bonesColor = Color3.fromRGB(230, 220, 200)
+        scheduleSave()
+        notify("Config reset to defaults", "Megs Script", 3)
+    end)
+    actions:Button("Save Now", function()
+        saveConfig()
+        notify("Config saved", "Megs Script", 2)
+    end)
+
+    -- RIGHT COLUMN: World first, then Colors
     local world = tab:Section("World", "Right")
 
     world:Toggle("esp_totem", "Totem", flags.totem, function(on) flags.totem = on; scheduleSave() end)
@@ -689,36 +722,6 @@ UI.AddTab("Megs Script", function(tab)
 
     colors:Toggle("esp_bonescolor_on", "Inadu Bones Color", true)
     colors:ColorPicker("esp_bonescolor", flags.bonesColor.R, flags.bonesColor.G, flags.bonesColor.B, 1, function(c) flags.bonesColor = c; scheduleSave() end)
-
-    local actions = tab:Section("Actions", "Left")
-    actions:Button("Reset Defaults", function()
-        flags.name = true
-        flags.health = true
-        flags.character = true
-        flags.regent = true
-        flags.linked = true
-        flags.channeling = true
-        flags.totem = true
-        flags.totemNotify = true
-        flags.regentNotify = true
-        flags.bones = true
-        flags.distance = false
-        flags.maxDist = 2000
-        flags.nameColor = Color3.fromRGB(255, 255, 255)
-        flags.healthColor = Color3.fromRGB(120, 255, 120)
-        flags.charColor = Color3.fromRGB(255, 200, 100)
-        flags.regentColor = Color3.fromRGB(255, 215, 0)
-        flags.linkedColor = Color3.fromRGB(100, 200, 255)
-        flags.channelColor = Color3.fromRGB(180, 255, 100)
-        flags.totemColor = Color3.fromRGB(255, 100, 200)
-        flags.bonesColor = Color3.fromRGB(230, 220, 200)
-        scheduleSave()
-        notify("Config reset to defaults", "Megs Script", 3)
-    end)
-    actions:Button("Save Now", function()
-        saveConfig()
-        notify("Config saved", "Megs Script", 2)
-    end)
 end)
 
 pcall(function()
