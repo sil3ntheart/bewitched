@@ -34,6 +34,7 @@ local flags = {
     charColor       = Color3.fromRGB(255, 200, 100),
     regentColor     = Color3.fromRGB(255, 215, 0),
     linkedColor     = Color3.fromRGB(100, 200, 255),
+    bladeColor      = Color3.fromRGB(199, 125, 255),
     channelColor    = Color3.fromRGB(180, 255, 100),
     totemColor      = Color3.fromRGB(255, 100, 200),
     bonesColor      = Color3.fromRGB(230, 220, 200),
@@ -255,30 +256,35 @@ local function getRegentValue(character)
     return nil
 end
 
-local function getLinkedTarget(character)
+-- ============================================================
+-- LINK DETECTION (3 sources: SacrificeLink > ConnectiveMagic)
+-- Returns: partnerName (string|nil), linkType ("blade"|"linked"|nil)
+-- ============================================================
+local function getLinkInfo(character)
     local cv = character:FindFirstChild("CharacterValues")
-    if not cv then return nil end
+    if not cv then return nil, nil end
+
+    -- 1. SacrificeLink (blade link) — ObjectValue pointing at partner model
+    local sac = cv:FindFirstChild("SacrificeLink")
+    if sac then
+        local ok, val = pcall(function() return sac.Value end)
+        if ok and val then
+            local partner = playerFromCharacter(val)
+            return partner and partner.Name or val.Name, "blade"
+        end
+    end
+
+    -- 2. ConnectiveMagic (regular link)
     local conn = cv:FindFirstChild("ConnectiveMagic")
-    if not conn then return nil end
-
-    local objVal = conn:FindFirstChild("ObjectValue")
-    if objVal and objVal.Value then
-        local target = playerFromCharacter(objVal.Value)
-        if target then return target.Name end
+    if conn then
+        local ok, val = pcall(function() return conn.Value end)
+        if ok and val then
+            local partner = playerFromCharacter(val)
+            if partner then return partner.Name, "linked" end
+        end
     end
 
-    if conn:IsA("ObjectValue") and conn.Value then
-        local target = playerFromCharacter(conn.Value)
-        if target then return target.Name end
-    end
-
-    local anyObj = conn:FindFirstChildWhichIsA("ObjectValue")
-    if anyObj and anyObj.Value then
-        local target = playerFromCharacter(anyObj.Value)
-        if target then return target.Name end
-    end
-
-    return nil
+    return nil, nil
 end
 
 local function getChannelTarget(character)
@@ -527,11 +533,16 @@ local function renderLoop()
 
                 if obj.linked then
                     if flags.linked then
-                        local linkedTo = getLinkedTarget(char)
-                        if linkedTo then
-                            obj.linked.Color = flags.linkedColor
+                        local partnerName, linkType = getLinkInfo(char)
+                        if partnerName then
+                            if linkType == "blade" then
+                                obj.linked.Color = flags.bladeColor
+                                obj.linked.Text = "Blade Linked: " .. partnerName
+                            else
+                                obj.linked.Color = flags.linkedColor
+                                obj.linked.Text = "Linked: " .. partnerName
+                            end
                             obj.linked.Position = Vector2.new(screenPos.X, topY - 18 + lineOffset)
-                            obj.linked.Text = "Linked: " .. linkedTo
                             obj.linked.Visible = true
                             lineOffset = lineOffset + 15
                         else
@@ -648,7 +659,7 @@ UI.AddTab("^.^ Meg", function(tab)
     esp:Toggle("esp_regent", "Regent", flags.regent, function(on) flags.regent = on; scheduleSave() end)
     esp:Tip("Shows Regent when a player holds the title")
     esp:Toggle("esp_linked", "Linked", flags.linked, function(on) flags.linked = on; scheduleSave() end)
-    esp:Tip("Shows who a player is linked to")
+    esp:Tip("Shows who a player is linked to (blade or regular)")
     esp:Toggle("esp_channeling", "Channeling", flags.channeling, function(on) flags.channeling = on; scheduleSave() end)
     esp:Tip("Shows who a player is channeling at")
 
@@ -672,6 +683,7 @@ UI.AddTab("^.^ Meg", function(tab)
         flags.charColor = Color3.fromRGB(255, 200, 100)
         flags.regentColor = Color3.fromRGB(255, 215, 0)
         flags.linkedColor = Color3.fromRGB(100, 200, 255)
+        flags.bladeColor = Color3.fromRGB(199, 125, 255)
         flags.channelColor = Color3.fromRGB(180, 255, 100)
         flags.totemColor = Color3.fromRGB(255, 100, 200)
         flags.bonesColor = Color3.fromRGB(230, 220, 200)
@@ -713,6 +725,9 @@ UI.AddTab("^.^ Meg", function(tab)
 
     colors:Toggle("esp_linkedcolor_on", "Linked Color", true)
     colors:ColorPicker("esp_linkedcolor", flags.linkedColor.R, flags.linkedColor.G, flags.linkedColor.B, 1, function(c) flags.linkedColor = c; scheduleSave() end)
+
+    colors:Toggle("esp_bladecolor_on", "Blade Linked Color", true)
+    colors:ColorPicker("esp_bladecolor", flags.bladeColor.R, flags.bladeColor.G, flags.bladeColor.B, 1, function(c) flags.bladeColor = c; scheduleSave() end)
 
     colors:Toggle("esp_channelcolor_on", "Channeling Color", true)
     colors:ColorPicker("esp_channelcolor", flags.channelColor.R, flags.channelColor.G, flags.channelColor.B, 1, function(c) flags.channelColor = c; scheduleSave() end)
