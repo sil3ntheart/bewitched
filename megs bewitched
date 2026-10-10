@@ -1,10 +1,22 @@
 -- ============================================================
--- Megs Script - Matcha version
+-- Megs Script - Matcha version (v2, max-perf)
 -- Order: Regency -> Linked -> Channeling -> Character -> Username -> HP -> Distance
 -- Totem label: Totem (NN)
 -- Config: saves/loads to megs_config.json (Color3-safe, no HttpService)
 -- Notifications: Totem Placement, Regent Available, Regent Taken
+--
+-- Perf design:
+--  * Drawing props only written when changed (write cache).
+--  * Drawings created lazily (only when a line is first shown).
+--  * Background loop @10 Hz: health + range checks.
+--    Every 2nd tick (5 Hz): names, regent, links, channeling, totem, bones.
+--  * Players beyond Max Distance are skipped in the background loop.
+--  * Render loop: distance cull -> behind-camera cull -> WorldToScreen.
+--  * Render rate is throttled (slider), default 60 Hz.
+--  * Set PROFILE = true to print average render cost every 5s.
 -- ============================================================
+
+local PROFILE = false
 
 local Nova = loadstring(httpget("https://raw.githubusercontent.com/Martinikaws/Nova/main/Nova.lua"))() or _G.Nova
 
@@ -12,6 +24,7 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
 local Camera = workspace.CurrentCamera
+local clock = os.clock or tick
 
 -- ============================================================
 -- STATE
@@ -30,6 +43,7 @@ local flags = {
     health          = true,
     distance        = false,
     maxDist         = 2000,
+    renderHz        = 60,
     nameColor       = Color3.fromRGB(255, 255, 255),
     charColor       = Color3.fromRGB(255, 200, 100),
     regentColor     = Color3.fromRGB(255, 215, 0),
@@ -41,7 +55,10 @@ local flags = {
     healthColor     = Color3.fromRGB(120, 255, 120),
 }
 
-local espObjects = {}
+local espObjects = {}   -- [player] = { lazily created drawings }
+local infos = {}        -- [player] = cached data
+local totemPos = nil
+local bonesPos = nil
 
 -- ============================================================
 -- CONFIG SAVE / LOAD
@@ -111,9 +128,52 @@ local function scheduleSave()
     end)
 end
 
+local renderInterval = 1 / math.max(flags.renderHz, 1)
+
+-- Feature-detect the cheap behind-camera test
+local useFrontCheck = pcall(function()
+    local v = Camera.CFrame.LookVector
+    return Vector3.new(1, 0, 0):Dot(v)
+end)
+
 -- ============================================================
--- DRAWING HELPERS
+-- DRAWING HELPERS (write cache + lazy creation)
 -- ============================================================
+local cache = setmetatable({}, { __mode = "k" })
+
+local function set(d, prop, val)
+    local c = cache[d]
+    if not c then
+        c = {}
+        cache[d] = c
+    end
+    if c[prop] ~= val then
+        c[prop] = val
+        d[prop] = val
+    end
+end
+
+local function setPos(d, x, y)
+    x = math.floor(x + 0.5)
+    y = math.floor(y + 0.5)
+    local c = cache[d]
+    if not c then
+        c = {}
+        cache[d] = c
+    end
+    if c.px ~= x or c.py ~= y then
+        c.px, c.py = x, y
+        d.Position = Vector2.new(x, y)
+    end
+end
+
+local function showLine(d, text, color, x, y)
+    set(d, "Text", text)
+    set(d, "Color", color)
+    setPos(d, x, y)
+    set(d, "Visible", true)
+end
+
 local function newText(size)
     local t = Drawing.new("Text")
     t.Size = size or 14
@@ -121,6 +181,31 @@ local function newText(size)
     t.Outline = true
     t.Visible = false
     return t
+end
+
+local SIZES = {
+    name = 14, character = 13, regent = 13, linked = 13,
+    channeling = 13, health = 13, dist = 12,
+}
+
+local function draw(obj, key)
+    local d = obj[key]
+    if not d then
+        d = newText(SIZES[key])
+        obj[key] = d
+    end
+    return d
+end
+
+local function hideKey(obj, key)
+    local d = obj[key]
+    if d then set(d, "Visible", false) end
+end
+
+local function hideAll(obj)
+    for _, d in pairs(obj) do
+        set(d, "Visible", false)
+    end
 end
 
 local function removeAll(tbl)
@@ -133,76 +218,68 @@ end
 local function createESP(player)
     if player == LocalPlayer then return end
     if espObjects[player] then return end
-
-    espObjects[player] = {
-        name       = newText(14),
-        character  = newText(13),
-        regent     = newText(13),
-        linked     = newText(13),
-        channeling = newText(13),
-        health     = newText(13),
-        dist       = newText(12),
-    }
+    espObjects[player] = {}
+    infos[player] = {}
 end
 
 local function removeESP(player)
     if not espObjects[player] then return end
     removeAll(espObjects[player])
     espObjects[player] = nil
+    infos[player] = nil
 end
 
 pcall(function()
     for _, p in ipairs(Players:GetPlayers()) do createESP(p) end
 end)
-
 pcall(function()
-    if Players.PlayerAdded then
-        Players.PlayerAdded:Connect(createESP)
-    end
+    if Players.PlayerAdded then Players.PlayerAdded:Connect(createESP) end
 end)
 pcall(function()
-    if Players.PlayerRemoving then
-        Players.PlayerRemoving:Connect(removeESP)
-    end
+    if Players.PlayerRemoving then Players.PlayerRemoving:Connect(removeESP) end
 end)
 
-task.spawn(function()
-    while true do
-        task.wait(1)
-        local ok, list = pcall(function() return Players:GetPlayers() end)
-        if ok and list then
-            local seen = {}
-            for _, p in ipairs(list) do
-                seen[p] = true
-                if not espObjects[p] and p ~= LocalPlayer then
-                    createESP(p)
-                end
-            end
-            for p in pairs(espObjects) do
-                if not seen[p] then
-                    removeESP(p)
-                end
-            end
+local function syncPlayers()
+    local ok, list = pcall(function() return Players:GetPlayers() end)
+    if not (ok and list) then return end
+    local seen = {}
+    for _, p in ipairs(list) do
+        seen[p] = true
+        if not espObjects[p] and p ~= LocalPlayer then
+            createESP(p)
         end
     end
-end)
+    for p in pairs(espObjects) do
+        if not seen[p] then removeESP(p) end
+    end
+end
 
 local totemText = newText(16)
 local bonesText = newText(16)
 
 -- ============================================================
--- READERS
+-- READERS (background loop only)
 -- ============================================================
-local function playerFromCharacter(model)
+local function playerFromCharacter(model, map)
     if not model then return nil end
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p.Character == model then return p end
-        if p.Character and model:IsDescendantOf(p.Character) then return p end
+    local p = map[model]
+    if p then return p end
+    for _, pl in ipairs(Players:GetPlayers()) do
+        local c = pl.Character
+        if c and model:IsDescendantOf(c) then return pl end
     end
     return nil
 end
 
-local function getCharacterName(character)
+local function readString(obj)
+    if obj:FindFirstChild("StringValue") or obj:IsA("StringValue") then
+        local ok, v = pcall(function() return obj.Value end)
+        if ok and v and v ~= "" then return tostring(v) end
+    end
+    return nil
+end
+
+local function getCharacterNameFast(character)
     local head = character:FindFirstChild("Head")
     if head then
         local info = head:FindFirstChild("Info")
@@ -219,7 +296,10 @@ local function getCharacterName(character)
             end
         end
     end
+    return nil
+end
 
+local function getCharacterNameSlow(character)
     for _, d in ipairs(character:GetDescendants()) do
         if d.Name == "CharacterName" then
             local tl = d:FindFirstChildWhichIsA("TextLabel")
@@ -234,73 +314,26 @@ local function getCharacterName(character)
     return nil
 end
 
-local function isRegent(character)
-    local cv = character:FindFirstChild("CharacterValues")
-    if not cv then return false end
-    return cv:FindFirstChild("Regent") ~= nil
-end
-
-local function getRegentValue(character)
-    local cv = character:FindFirstChild("CharacterValues")
-    if not cv then return nil end
-    local regent = cv:FindFirstChild("Regent")
-    if not regent then return nil end
-    if regent:FindFirstChild("StringValue") then
-        if regent.Value and regent.Value ~= "" then
-            return tostring(regent.Value)
-        end
-    end
-    if regent:IsA("StringValue") and regent.Value and regent.Value ~= "" then
-        return tostring(regent.Value)
-    end
-    return nil
-end
-
--- ============================================================
--- LINK DETECTION (3 sources: SacrificeLink > ConnectiveMagic)
--- Returns: partnerName (string|nil), linkType ("blade"|"linked"|nil)
--- ============================================================
-local function getLinkInfo(character)
-    local cv = character:FindFirstChild("CharacterValues")
-    if not cv then return nil, nil end
-
-    -- 1. SacrificeLink (blade link) — ObjectValue pointing at partner model
+local function getLinkInfo(cv, map)
     local sac = cv:FindFirstChild("SacrificeLink")
     if sac then
         local ok, val = pcall(function() return sac.Value end)
         if ok and val then
-            local partner = playerFromCharacter(val)
+            local partner = playerFromCharacter(val, map)
             return partner and partner.Name or val.Name, "blade"
         end
     end
 
-    -- 2. ConnectiveMagic (regular link)
     local conn = cv:FindFirstChild("ConnectiveMagic")
     if conn then
         local ok, val = pcall(function() return conn.Value end)
         if ok and val then
-            local partner = playerFromCharacter(val)
+            local partner = playerFromCharacter(val, map)
             if partner then return partner.Name, "linked" end
         end
     end
 
     return nil, nil
-end
-
-local function getChannelTarget(character)
-    local cv = character:FindFirstChild("CharacterValues")
-    if not cv then return nil end
-    local ch = cv:FindFirstChild("Channeled")
-    if not ch then return nil end
-    if ch:FindFirstChild("StringValue") then
-        if ch.Value and ch.Value ~= "" then
-            return tostring(ch.Value)
-        end
-    end
-    if ch:IsA("StringValue") and ch.Value and ch.Value ~= "" then
-        return tostring(ch.Value)
-    end
-    return nil
 end
 
 -- ============================================================
@@ -379,28 +412,6 @@ local function getBonesPosition()
     return nil
 end
 
--- ============================================================
--- NOTIFICATIONS
--- ============================================================
-local totemWasPlaced = isTotemPlaced()
-
-task.spawn(function()
-    while true do
-        task.wait(0.5)
-        local nowPlaced = isTotemPlaced()
-        if nowPlaced and not totemWasPlaced then
-            if flags.totemNotify and flags.enabled then
-                pcall(function()
-                    notify("A totem ritual has been placed", "Totem Placement", 4)
-                end)
-            end
-            totemWasPlaced = true
-        elseif not nowPlaced and totemWasPlaced then
-            totemWasPlaced = false
-        end
-    end
-end)
-
 local function anyoneIsRegent()
     for _, p in ipairs(Players:GetPlayers()) do
         local char = p.Character
@@ -414,19 +425,168 @@ local function anyoneIsRegent()
     return false, nil
 end
 
+-- ============================================================
+-- BACKGROUND LOOP (10 Hz; heavy work every 2nd tick = 5 Hz)
+-- ============================================================
+local tickCount = 0
+local totemWasPlaced = isTotemPlaced()
 local regentCurrentlyTaken = false
+local regentInit = false
 
-task.spawn(function()
-    task.wait(2)
+local function refreshPlayer(player, info, map)
+    local char = player.Character
 
-    local taken, holder = anyoneIsRegent()
-    regentCurrentlyTaken = taken
-    print("[Regent] initial state: " .. (taken and ("taken by " .. tostring(holder)) or "available"))
+    if char ~= info.char then
+        info.char = char
+        info.hrp = nil
+        info.hum = nil
+        info.hp = nil
+        info.regentText = nil
+        info.linkText = nil
+        info.linkKind = nil
+        info.chText = nil
+        info.charName = nil
+        info.nameFallbackTick = nil
+    end
+    if not char then return end
 
-    while true do
-        task.wait(1)
+    if not info.hrp or not info.hrp.Parent then
+        info.hrp = char:FindFirstChild("HumanoidRootPart")
+    end
+    if not info.hum or not info.hum.Parent then
+        info.hum = char:FindFirstChildOfClass("Humanoid")
+    end
+    if info.hum then
+        info.maxHp = math.floor(info.hum.MaxHealth)
+    end
+
+    local cv = char:FindFirstChild("CharacterValues")
+
+    info.regentText = nil
+    if flags.regent and cv then
+        local r = cv:FindFirstChild("Regent")
+        if r then
+            local rv = readString(r)
+            info.regentText = rv and ("Regent: " .. rv) or "Regent"
+        end
+    end
+
+    info.linkText, info.linkKind = nil, nil
+    if flags.linked and cv then
+        local name, kind = getLinkInfo(cv, map)
+        if name then
+            info.linkKind = kind
+            info.linkText = (kind == "blade" and "Blade Linked: " or "Linked: ") .. name
+        end
+    end
+
+    info.chText = nil
+    if flags.channeling and cv then
+        local ch = cv:FindFirstChild("Channeled")
+        if ch then
+            local t = readString(ch)
+            if t then info.chText = "Channeling: " .. t end
+        end
+    end
+
+    if flags.character then
+        local n = getCharacterNameFast(char)
+        if n then
+            info.charName = n
+        elseif not info.charName then
+            -- rare, throttled fallback (~every 5s)
+            if not info.nameFallbackTick or (tickCount - info.nameFallbackTick) >= 50 then
+                info.nameFallbackTick = tickCount
+                info.charName = getCharacterNameSlow(char)
+            end
+        end
+    else
+        info.charName = nil
+    end
+end
+
+local function slowTick()
+    tickCount = tickCount + 1
+    local heavy = (tickCount % 2 == 0)
+
+    local cam = workspace.CurrentCamera
+    if cam then Camera = cam end
+
+    if tickCount % 10 == 0 then
+        syncPlayers()
+    end
+
+    if flags.enabled then
+        local camPos = Camera.CFrame.Position
+        local cullDist = flags.maxDist * 1.1
+
+        local map
+        if heavy then
+            map = {}
+            for _, p in ipairs(Players:GetPlayers()) do
+                local c = p.Character
+                if c then map[c] = p end
+            end
+        end
+
+        for player in pairs(espObjects) do
+            local info = infos[player]
+            if info then
+                local hrp = info.hrp
+                local valid = hrp and hrp.Parent and player.Character == info.char
+                local inRange = true
+                if valid then
+                    inRange = (camPos - hrp.Position).Magnitude <= cullDist
+                end
+
+                -- skip everything for far-away players
+                if inRange then
+                    if heavy or not valid then
+                        if heavy then
+                            local ok = pcall(refreshPlayer, player, info, map)
+                            if not ok then info.char = nil end
+                        end
+                    end
+                    local hum = info.hum
+                    if hum and info.hrp then
+                        info.hp = hum.Health
+                    end
+                end
+            end
+        end
+
+        if heavy then
+            totemPos = flags.totem and getTotemPosition() or nil
+            bonesPos = flags.bones and getBonesPosition() or nil
+        end
+    else
+        totemPos = nil
+        bonesPos = nil
+    end
+
+    -- Totem placement notification (~0.4s)
+    if tickCount % 4 == 0 then
+        local nowPlaced = isTotemPlaced()
+        if nowPlaced and not totemWasPlaced then
+            if flags.totemNotify and flags.enabled then
+                pcall(function()
+                    notify("A totem ritual has been placed", "Totem Placement", 4)
+                end)
+            end
+            totemWasPlaced = true
+        elseif not nowPlaced and totemWasPlaced then
+            totemWasPlaced = false
+        end
+    end
+
+    -- Regent notification (~1s, first state captured after ~2s)
+    if tickCount % 10 == 0 and tickCount >= 20 then
         local nowTaken, nowHolder = anyoneIsRegent()
-        if nowTaken and not regentCurrentlyTaken then
+        if not regentInit then
+            regentInit = true
+            regentCurrentlyTaken = nowTaken
+            print("[Regent] initial state: " .. (nowTaken and ("taken by " .. tostring(nowHolder)) or "available"))
+        elseif nowTaken and not regentCurrentlyTaken then
             if flags.regentNotify and flags.enabled then
                 pcall(function()
                     notify("Regent is taken" .. (nowHolder and (" by " .. nowHolder) or ""), "Regent", 4)
@@ -442,205 +602,177 @@ task.spawn(function()
             regentCurrentlyTaken = false
         end
     end
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.1)
+        pcall(slowTick)
+    end
 end)
 
 -- ============================================================
--- RENDER LOOP
+-- RENDER LOOP (throttled; reads only position per player)
 -- ============================================================
+local wasEnabled = false
+local lastRender = 0
+
+local function worldLabel(textObj, enabledFlag, pos, color, text, camPos)
+    if enabledFlag and pos then
+        local screenPos, onScreen = WorldToScreen(pos)
+        if onScreen then
+            local t = text
+            if type(text) == "function" then t = text((camPos - pos).Magnitude) end
+            set(textObj, "Color", color)
+            set(textObj, "Text", t)
+            setPos(textObj, screenPos.X, screenPos.Y)
+            set(textObj, "Visible", true)
+            return
+        end
+    end
+    set(textObj, "Visible", false)
+end
+
+local function totemLabel(d)
+    return "Totem (" .. math.floor(d) .. ")"
+end
+
 local function renderLoop()
     if not flags.enabled then
-        for _, obj in pairs(espObjects) do
-            for _, d in pairs(obj) do if d then d.Visible = false end end
+        if wasEnabled then
+            wasEnabled = false
+            for _, obj in pairs(espObjects) do hideAll(obj) end
+            set(totemText, "Visible", false)
+            set(bonesText, "Visible", false)
         end
-        if totemText then totemText.Visible = false end
-        if bonesText then bonesText.Visible = false end
         return
     end
+    wasEnabled = true
 
-    local camPos = Camera.CFrame.Position
+    -- throttle (0.9 tolerance so a matching refresh rate doesn't halve)
+    local now = clock()
+    if now - lastRender < renderInterval * 0.9 then return end
+    lastRender = now
 
-    if totemText then
-        if flags.totem then
-            local totemPos = getTotemPosition()
-            if totemPos then
-                local screenPos, onScreen = WorldToScreen(totemPos)
-                if onScreen then
-                    local totemDistance = (camPos - totemPos).Magnitude
-                    totemText.Color = flags.totemColor
-                    totemText.Position = Vector2.new(screenPos.X, screenPos.Y)
-                    totemText.Text = "Totem (" .. math.floor(totemDistance) .. ")"
-                    totemText.Visible = true
-                else
-                    totemText.Visible = false
-                end
-            else
-                totemText.Visible = false
-            end
-        else
-            totemText.Visible = false
-        end
-    end
+    local cf = Camera.CFrame
+    local camPos = cf.Position
+    local look = useFrontCheck and cf.LookVector or nil
+    local maxDist = flags.maxDist
 
-    if bonesText then
-        if flags.bones then
-            local bonesPos = getBonesPosition()
-            if bonesPos then
-                local screenPos, onScreen = WorldToScreen(bonesPos)
-                if onScreen then
-                    bonesText.Color = flags.bonesColor
-                    bonesText.Position = Vector2.new(screenPos.X, screenPos.Y)
-                    bonesText.Text = "Inadu Bones"
-                    bonesText.Visible = true
-                else
-                    bonesText.Visible = false
-                end
-            else
-                bonesText.Visible = false
-            end
-        else
-            bonesText.Visible = false
-        end
-    end
+    -- cache flags into locals
+    local fName, fHealth, fChar, fDist = flags.name, flags.health, flags.character, flags.distance
+    local cName, cHealth, cChar = flags.nameColor, flags.healthColor, flags.charColor
+    local cRegent, cLinked, cBlade, cChan = flags.regentColor, flags.linkedColor, flags.bladeColor, flags.channelColor
+
+    worldLabel(totemText, flags.totem, totemPos, flags.totemColor, totemLabel, camPos)
+    worldLabel(bonesText, flags.bones, bonesPos, flags.bonesColor, "Inadu Bones", camPos)
 
     for player, obj in pairs(espObjects) do
-        local char = player.Character
-        local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+        local info = infos[player]
+        local hrp = info and info.hrp
+        local hp = info and info.hp
 
-        if hrp and humanoid and humanoid.Health > 0 then
+        local shown = false
+
+        if hrp and hp and hp > 0 then
             local worldPos = hrp.Position
-            local screenPos, onScreen = WorldToScreen(worldPos)
-            local dist = (camPos - worldPos).Magnitude
+            local diff = worldPos - camPos
+            local dist = diff.Magnitude
 
-            if onScreen and dist <= flags.maxDist then
-                local size = math.clamp(1500 / dist, 20, 250)
-                local halfH = size * 0.5
-                local topY = screenPos.Y - halfH
-                local lineOffset = 0
+            -- 1) distance cull, 2) behind-camera cull, 3) projection
+            if dist <= maxDist and (not look or diff:Dot(look) > 0) then
+                local screenPos, onScreen = WorldToScreen(worldPos)
+                if onScreen then
+                    shown = true
 
-                if obj.regent then
-                    if flags.regent and isRegent(char) then
-                        local rv = getRegentValue(char)
-                        obj.regent.Color = flags.regentColor
-                        obj.regent.Position = Vector2.new(screenPos.X, topY - 18 + lineOffset)
-                        obj.regent.Text = rv and ("Regent: " .. rv) or "Regent"
-                        obj.regent.Visible = true
-                        lineOffset = lineOffset + 15
+                    local size = math.clamp(1500 / dist, 20, 250)
+                    local x = screenPos.X
+                    local y = screenPos.Y - size * 0.5 - 18
+
+                    if info.regentText then
+                        showLine(draw(obj, "regent"), info.regentText, cRegent, x, y)
+                        y = y + 15
                     else
-                        obj.regent.Visible = false
+                        hideKey(obj, "regent")
+                    end
+
+                    if info.linkText then
+                        showLine(draw(obj, "linked"), info.linkText,
+                            (info.linkKind == "blade") and cBlade or cLinked, x, y)
+                        y = y + 15
+                    else
+                        hideKey(obj, "linked")
+                    end
+
+                    if info.chText then
+                        showLine(draw(obj, "channeling"), info.chText, cChan, x, y)
+                        y = y + 15
+                    else
+                        hideKey(obj, "channeling")
+                    end
+
+                    if fChar and info.charName then
+                        showLine(draw(obj, "character"), info.charName, cChar, x, y)
+                        y = y + 15
+                    else
+                        hideKey(obj, "character")
+                    end
+
+                    if fName then
+                        showLine(draw(obj, "name"), player.Name, cName, x, y)
+                        y = y + 16
+                    else
+                        hideKey(obj, "name")
+                    end
+
+                    if fHealth then
+                        showLine(draw(obj, "health"),
+                            "HP: " .. math.floor(hp) .. " / " .. (info.maxHp or 100),
+                            cHealth, x, y)
+                        y = y + 15
+                    else
+                        hideKey(obj, "health")
+                    end
+
+                    if fDist then
+                        showLine(draw(obj, "dist"), tostring(math.floor(dist)), cName, x, y)
+                    else
+                        hideKey(obj, "dist")
                     end
                 end
-
-                if obj.linked then
-                    if flags.linked then
-                        local partnerName, linkType = getLinkInfo(char)
-                        if partnerName then
-                            if linkType == "blade" then
-                                obj.linked.Color = flags.bladeColor
-                                obj.linked.Text = "Blade Linked: " .. partnerName
-                            else
-                                obj.linked.Color = flags.linkedColor
-                                obj.linked.Text = "Linked: " .. partnerName
-                            end
-                            obj.linked.Position = Vector2.new(screenPos.X, topY - 18 + lineOffset)
-                            obj.linked.Visible = true
-                            lineOffset = lineOffset + 15
-                        else
-                            obj.linked.Visible = false
-                        end
-                    else
-                        obj.linked.Visible = false
-                    end
-                end
-
-                if obj.channeling then
-                    if flags.channeling then
-                        local chTarget = getChannelTarget(char)
-                        if chTarget then
-                            obj.channeling.Color = flags.channelColor
-                            obj.channeling.Position = Vector2.new(screenPos.X, topY - 18 + lineOffset)
-                            obj.channeling.Text = "Channeling: " .. chTarget
-                            obj.channeling.Visible = true
-                            lineOffset = lineOffset + 15
-                        else
-                            obj.channeling.Visible = false
-                        end
-                    else
-                        obj.channeling.Visible = false
-                    end
-                end
-
-                if obj.character then
-                    if flags.character then
-                        local cName = getCharacterName(char)
-                        if cName then
-                            obj.character.Color = flags.charColor
-                            obj.character.Position = Vector2.new(screenPos.X, topY - 18 + lineOffset)
-                            obj.character.Text = cName
-                            obj.character.Visible = true
-                            lineOffset = lineOffset + 15
-                        else
-                            obj.character.Visible = false
-                        end
-                    else
-                        obj.character.Visible = false
-                    end
-                end
-
-                if obj.name then
-                    if flags.name then
-                        obj.name.Color = flags.nameColor
-                        obj.name.Position = Vector2.new(screenPos.X, topY - 18 + lineOffset)
-                        obj.name.Text = player.Name
-                        obj.name.Visible = true
-                    else
-                        obj.name.Visible = false
-                    end
-                end
-                if flags.name then lineOffset = lineOffset + 16 end
-
-                if obj.health then
-                    if flags.health then
-                        local hp = math.floor(humanoid.Health)
-                        local maxHp = math.floor(humanoid.MaxHealth)
-                        obj.health.Color = flags.healthColor
-                        obj.health.Position = Vector2.new(screenPos.X, topY - 18 + lineOffset)
-                        obj.health.Text = "HP: " .. hp .. " / " .. maxHp
-                        obj.health.Visible = true
-                    else
-                        obj.health.Visible = false
-                    end
-                end
-                if flags.health then lineOffset = lineOffset + 15 end
-
-                if obj.dist then
-                    if flags.distance then
-                        obj.dist.Color = flags.nameColor
-                        obj.dist.Position = Vector2.new(screenPos.X, topY - 18 + lineOffset)
-                        obj.dist.Text = tostring(math.floor(dist))
-                        obj.dist.Visible = true
-                        lineOffset = lineOffset + 15
-                    else
-                        obj.dist.Visible = false
-                    end
-                end
-            else
-                for _, d in pairs(obj) do if d then d.Visible = false end end
             end
-        else
-            for _, d in pairs(obj) do if d then d.Visible = false end end
+        end
+
+        if not shown then
+            hideAll(obj)
+        end
+    end
+end
+
+-- optional profiler
+local renderEntry = renderLoop
+if PROFILE then
+    local acc, n, last = 0, 0, clock()
+    renderEntry = function()
+        local t0 = clock()
+        renderLoop()
+        acc = acc + (clock() - t0)
+        n = n + 1
+        if clock() - last >= 5 then
+            print(string.format("[Megs profile] avg render: %.3f ms over %d calls", (acc / n) * 1000, n))
+            acc, n, last = 0, 0, clock()
         end
     end
 end
 
 local renderOK = pcall(function()
-    RunService.RenderStepped:Connect(renderLoop)
+    RunService.RenderStepped:Connect(renderEntry)
 end)
 if not renderOK then
     task.spawn(function()
         while true do
             task.wait()
-            pcall(renderLoop)
+            pcall(renderEntry)
         end
     end)
 end
@@ -678,6 +810,8 @@ UI.AddTab("^.^ Meg", function(tab)
         flags.bones = true
         flags.distance = false
         flags.maxDist = 2000
+        flags.renderHz = 60
+        renderInterval = 1 / 60
         flags.nameColor = Color3.fromRGB(255, 255, 255)
         flags.healthColor = Color3.fromRGB(120, 255, 120)
         flags.charColor = Color3.fromRGB(255, 200, 100)
@@ -708,6 +842,12 @@ UI.AddTab("^.^ Meg", function(tab)
     world:Tip("Shows a label at the bones' position")
     world:Toggle("esp_distance", "Distance", flags.distance, function(on) flags.distance = on; scheduleSave() end)
     world:SliderInt("esp_maxdist", "Max Distance", 100, 10000, flags.maxDist, function(v) flags.maxDist = v; scheduleSave() end)
+    world:SliderInt("esp_renderhz", "Render Rate (Hz)", 10, 240, flags.renderHz, function(v)
+        flags.renderHz = v
+        renderInterval = 1 / math.max(v, 1)
+        scheduleSave()
+    end)
+    world:Tip("Lower = better FPS. Higher = smoother labels")
 
     local colors = tab:Section("Colors", "Right")
 
