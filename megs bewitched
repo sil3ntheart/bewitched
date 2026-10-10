@@ -793,7 +793,7 @@ end
 -- ============================================================
 -- UI
 -- ============================================================
-UI.AddTab("^.^Megs bw", function(tab)
+UI.AddTab("^.^meg bw", function(tab)
     local esp = tab:Section("ESP", "Left")
 
     esp:Toggle("esp_enabled", "Enable ESP", false, function(on) flags.enabled = on; scheduleSave() end)
