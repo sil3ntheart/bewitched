@@ -1,5 +1,5 @@
 -- ============================================================
--- Megs Script - Matcha version (v2, max-perf)
+-- Megs Script - Matcha version (v2, max-perf + Dahlia's Link)
 -- Order: Regency -> Linked -> Channeling -> Character -> Username -> HP -> Distance
 -- Totem label: Totem (NN)
 -- Config: saves/loads to megs_config.json (Color3-safe, no HttpService)
@@ -12,7 +12,7 @@
 --    Every 2nd tick (5 Hz): names, regent, links, channeling, totem, bones.
 --  * Players beyond Max Distance are skipped in the background loop.
 --  * Render loop: distance cull -> behind-camera cull -> WorldToScreen.
---  * Render rate is throttled (slider), default 60 Hz.
+--  * Render rate is fixed at 60 Hz.
 --  * Set PROFILE = true to print average render cost every 5s.
 -- ============================================================
 
@@ -55,8 +55,8 @@ local flags = {
     healthColor     = Color3.fromRGB(120, 255, 120),
 }
 
-local espObjects = {}   -- [player] = { lazily created drawings }
-local infos = {}        -- [player] = cached data
+local espObjects = {}
+local infos = {}
 local totemPos = nil
 local bonesPos = nil
 
@@ -130,7 +130,6 @@ end
 
 local renderInterval = 1 / math.max(flags.renderHz, 1)
 
--- Feature-detect the cheap behind-camera test
 local useFrontCheck = pcall(function()
     local v = Camera.CFrame.LookVector
     return Vector3.new(1, 0, 0):Dot(v)
@@ -314,6 +313,10 @@ local function getCharacterNameSlow(character)
     return nil
 end
 
+-- Combined link resolver:
+--   * SacrificeLink            -> "blade"
+--   * ConnectiveMagic (normal) -> "linked"
+--   * ConnectiveMagic (Dahlia) -> "dahlia"  (still shows under "Linked")
 local function getLinkInfo(cv, map)
     local sac = cv:FindFirstChild("SacrificeLink")
     if sac then
@@ -328,8 +331,14 @@ local function getLinkInfo(cv, map)
     if conn then
         local ok, val = pcall(function() return conn.Value end)
         if ok and val then
+            local cn = readString(cv:FindFirstChild("CharacterName"))
+            local isDahlia = cn and cn:lower():find("dahlia", 1, true)
+
             local partner = playerFromCharacter(val, map)
-            if partner then return partner.Name, "linked" end
+            local name = partner and partner.Name or val.Name
+            if name then
+                return name, isDahlia and "dahlia" or "linked"
+            end
         end
     end
 
@@ -476,7 +485,13 @@ local function refreshPlayer(player, info, map)
         local name, kind = getLinkInfo(cv, map)
         if name then
             info.linkKind = kind
-            info.linkText = (kind == "blade" and "Blade Linked: " or "Linked: ") .. name
+            if kind == "blade" then
+                info.linkText = "Blade Linked: " .. name
+            elseif kind == "dahlia" then
+                info.linkText = "Dahlia's Link: " .. name
+            else
+                info.linkText = "Linked: " .. name
+            end
         end
     end
 
@@ -494,7 +509,6 @@ local function refreshPlayer(player, info, map)
         if n then
             info.charName = n
         elseif not info.charName then
-            -- rare, throttled fallback (~every 5s)
             if not info.nameFallbackTick or (tickCount - info.nameFallbackTick) >= 50 then
                 info.nameFallbackTick = tickCount
                 info.charName = getCharacterNameSlow(char)
@@ -539,7 +553,6 @@ local function slowTick()
                     inRange = (camPos - hrp.Position).Magnitude <= cullDist
                 end
 
-                -- skip everything for far-away players
                 if inRange then
                     if heavy or not valid then
                         if heavy then
@@ -564,7 +577,6 @@ local function slowTick()
         bonesPos = nil
     end
 
-    -- Totem placement notification (~0.4s)
     if tickCount % 4 == 0 then
         local nowPlaced = isTotemPlaced()
         if nowPlaced and not totemWasPlaced then
@@ -579,7 +591,6 @@ local function slowTick()
         end
     end
 
-    -- Regent notification (~1s, first state captured after ~2s)
     if tickCount % 10 == 0 and tickCount >= 20 then
         local nowTaken, nowHolder = anyoneIsRegent()
         if not regentInit then
@@ -612,7 +623,7 @@ task.spawn(function()
 end)
 
 -- ============================================================
--- RENDER LOOP (throttled; reads only position per player)
+-- RENDER LOOP
 -- ============================================================
 local wasEnabled = false
 local lastRender = 0
@@ -649,7 +660,6 @@ local function renderLoop()
     end
     wasEnabled = true
 
-    -- throttle (0.9 tolerance so a matching refresh rate doesn't halve)
     local now = clock()
     if now - lastRender < renderInterval * 0.9 then return end
     lastRender = now
@@ -659,7 +669,6 @@ local function renderLoop()
     local look = useFrontCheck and cf.LookVector or nil
     local maxDist = flags.maxDist
 
-    -- cache flags into locals
     local fName, fHealth, fChar, fDist = flags.name, flags.health, flags.character, flags.distance
     local cName, cHealth, cChar = flags.nameColor, flags.healthColor, flags.charColor
     local cRegent, cLinked, cBlade, cChan = flags.regentColor, flags.linkedColor, flags.bladeColor, flags.channelColor
@@ -679,7 +688,6 @@ local function renderLoop()
             local diff = worldPos - camPos
             local dist = diff.Magnitude
 
-            -- 1) distance cull, 2) behind-camera cull, 3) projection
             if dist <= maxDist and (not look or diff:Dot(look) > 0) then
                 local screenPos, onScreen = WorldToScreen(worldPos)
                 if onScreen then
@@ -697,8 +705,14 @@ local function renderLoop()
                     end
 
                     if info.linkText then
-                        showLine(draw(obj, "linked"), info.linkText,
-                            (info.linkKind == "blade") and cBlade or cLinked, x, y)
+                        local lc
+                        if info.linkKind == "blade" then
+                            lc = cBlade
+                        else
+                            -- both "linked" and "dahlia" use linkedColor
+                            lc = cLinked
+                        end
+                        showLine(draw(obj, "linked"), info.linkText, lc, x, y)
                         y = y + 15
                     else
                         hideKey(obj, "linked")
@@ -749,7 +763,6 @@ local function renderLoop()
     end
 end
 
--- optional profiler
 local renderEntry = renderLoop
 if PROFILE then
     local acc, n, last = 0, 0, clock()
@@ -780,8 +793,7 @@ end
 -- ============================================================
 -- UI
 -- ============================================================
-UI.AddTab("^.^ Meg", function(tab)
-    -- LEFT COLUMN: ESP first, then Actions immediately after
+UI.AddTab("^.^Megs bw", function(tab)
     local esp = tab:Section("ESP", "Left")
 
     esp:Toggle("esp_enabled", "Enable ESP", false, function(on) flags.enabled = on; scheduleSave() end)
@@ -791,11 +803,10 @@ UI.AddTab("^.^ Meg", function(tab)
     esp:Toggle("esp_regent", "Regent", flags.regent, function(on) flags.regent = on; scheduleSave() end)
     esp:Tip("Shows Regent when a player holds the title")
     esp:Toggle("esp_linked", "Linked", flags.linked, function(on) flags.linked = on; scheduleSave() end)
-    esp:Tip("Shows who a player is linked to (blade or regular)")
+    esp:Tip("Shows who a player is linked to (blade, connective, or Dahlia's Link)")
     esp:Toggle("esp_channeling", "Channeling", flags.channeling, function(on) flags.channeling = on; scheduleSave() end)
     esp:Tip("Shows who a player is channeling at")
 
-    -- Actions declared immediately after ESP so Matcha puts it in the left column
     local actions = tab:Section("Actions", "Left")
     actions:Button("Reset Defaults", function()
         flags.name = true
@@ -829,7 +840,6 @@ UI.AddTab("^.^ Meg", function(tab)
         notify("Config saved", "Megs Script", 2)
     end)
 
-    -- RIGHT COLUMN: World first, then Colors
     local world = tab:Section("World", "Right")
 
     world:Toggle("esp_totem", "Totem", flags.totem, function(on) flags.totem = on; scheduleSave() end)
@@ -842,12 +852,6 @@ UI.AddTab("^.^ Meg", function(tab)
     world:Tip("Shows a label at the bones' position")
     world:Toggle("esp_distance", "Distance", flags.distance, function(on) flags.distance = on; scheduleSave() end)
     world:SliderInt("esp_maxdist", "Max Distance", 100, 10000, flags.maxDist, function(v) flags.maxDist = v; scheduleSave() end)
-    world:SliderInt("esp_renderhz", "Render Rate (Hz)", 10, 240, flags.renderHz, function(v)
-        flags.renderHz = v
-        renderInterval = 1 / math.max(v, 1)
-        scheduleSave()
-    end)
-    world:Tip("Lower = better FPS. Higher = smoother labels")
 
     local colors = tab:Section("Colors", "Right")
 
